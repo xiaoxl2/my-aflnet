@@ -398,6 +398,19 @@ u8 seed_schedule_type = IPSM_SCHEDULE; /* Choose next seeds based on state machi
 u8 code_aware_schedule = 0;
 u8 false_negative_reduction = 0;
 
+/* change */
+/* RBFUZZ-specific variables */
+u32 *branch_hits_map = NULL;          /* Formula(1): cumulative hit count for each branch across all seeds */
+u32 rare_branch_threshold = 0;        /* Current rare branch threshold (Algorithm 1) */
+u8  *rare_branch_bitmap = NULL;       /* Marks which branches are rare (1=rare, 0=not) */
+khash_t(sbm) *state_branch_map = NULL;   /* Formula(2): state_id -> branch bitmap */
+khash_t(sdbm) *seed_branch_map = NULL;   /* Formula(3): seed_index -> branch bitmap */
+khash_t(fbm) *fuzzed_branches_map = NULL; /* Algorithm 3: seed_index -> already-fuzzed rare branches */
+u32 rbfuzz_iteration_count = 0;       /* Main loop iteration counter */
+u8  rbfuzz_guided_mode = 0;           /* 0=default phase, 1=rare branch guided phase */
+/* change */
+
+
 /* Implemented state machine */
 Agraph_t  *ipsm;
 static FILE* ipsm_dot_file;
@@ -406,6 +419,8 @@ static FILE* ipsm_dot_file;
 klist_t(lms) *kl_messages;
 khash_t(hs32) *khs_ipsm_paths;
 khash_t(hms) *khms_states;
+
+
 
 //M2_prev points to the last message of M1 (i.e., prefix)
 //If M1 is empty, M2_prev == NULL
@@ -428,6 +443,15 @@ void setup_ipsm()
   khs_ipsm_paths = kh_init(hs32);
 
   khms_states = kh_init(hms);
+
+  /* change */
+  branch_hits_map = (u32 *)ck_alloc(MAP_SIZE * sizeof(u32));
+  rare_branch_bitmap = (u8 *)ck_alloc(MAP_SIZE);
+  state_branch_map = kh_init(sbm);
+  seed_branch_map = kh_init(sdbm);
+  fuzzed_branches_map = kh_init(fbm);
+  /* change */
+
 }
 
 /* Free memory allocated to state-machine variables */
@@ -442,6 +466,24 @@ void destroy_ipsm()
   kh_destroy(hms, khms_states);
 
   ck_free(state_ids);
+
+  /* change */
+  ck_free(branch_hits_map);
+  ck_free(rare_branch_bitmap);
+
+  u8 *sbm_val;
+  kh_foreach_value(state_branch_map, sbm_val, { ck_free(sbm_val); });
+  kh_destroy(sbm, state_branch_map);
+
+  u8 *sdbm_val;
+  kh_foreach_value(seed_branch_map, sdbm_val, { ck_free(sdbm_val); });
+  kh_destroy(sdbm, seed_branch_map);
+
+  u8 *fbm_val;
+  kh_foreach_value(fuzzed_branches_map, fbm_val, { ck_free(fbm_val); });
+  kh_destroy(fbm, fuzzed_branches_map);
+  /* change */
+
 }
 
 /* Get state index in the state IDs list, given a state ID */
@@ -605,6 +647,40 @@ u32 index_search(u32 *A, u32 n, u32 val) {
   return index;
 }
 
+/* change */
+/* indentify rare branches*/
+
+void identify_rare_branches() {
+  u32 min_hits = UINT32_MAX;
+  u32 i;
+
+  /* find minimum hits */
+  for(i = 0; i < MAP_SIZE; i++) {
+    if(branch_hits_map[i] > 0 && branch_hits_map[i] < min_hits) {
+      min_hits = branch_hits_map[i];
+    }
+  }
+
+  /* set threshold */
+  if(min_hits == UINT32_MAX) {
+    rare_branch_threshold = 1;
+  } else {
+    rare_branch_threshold = 1 << (32 - __builtin_clz(min_hits));
+  }
+
+  /* mark branches */
+  for(i = 0; i < MAP_SIZE; i++) {
+    if(branch_hits_map[i] > 0 && branch_hits_map[i] < rare_branch_threshold) {
+      rare_branch_bitmap[i] = 1;
+    } else {
+      rare_branch_bitmap[i] = 0;
+    }
+  }
+
+}
+
+/* change */
+
 /* Calculate state scores and select the next state */
 u32 update_scores_and_select_next_state(u8 mode) {
   u32 result = 0, i;
@@ -646,6 +722,110 @@ u32 update_scores_and_select_next_state(u8 mode) {
   if (state_scores) ck_free(state_scores);
   return result;
 }
+
+/* change */
+u32 rbfuzz_topsis_select_state() {
+
+  if(state_ids_count == 0) return 0;
+
+  u32 i, j;
+  khint_t k;
+  state_info_t *state;
+
+  /* collect info */
+  double *nr_arr = (double *)ck_alloc(state_ids_count * sizeof(double));
+  double *ns_arr = (double *)ck_alloc(state_ids_count * sizeof(double));
+  double *nf_arr = (double *)ck_alloc(state_ids_count * sizeof(double));
+  double *np_arr = (double *)ck_alloc(state_ids_count * sizeof(double));
+
+  double sum_nr = 0, sum_ns = 0, sum_nf = 0, sum_np = 0;
+
+  for (i = 0; i < state_ids_count; i++) {
+    u32 state_id = state_ids[i];
+
+    k = kh_get(hms, khms_states, state_id);
+    if (k == kh_end(khms_states)) continue;
+    state = kh_val(khms_states, k);
+
+    /* Nr: count rare branches reachable from this state
+     * = |rare_branch_bitmap ∩ state_branch_map[state]|
+     */
+    u32 nr = 0;
+    khint_t sk = kh_get(sbm, state_branch_map, state_id);
+    if (sk != kh_end(state_branch_map)) {
+      u8 *sbmap = kh_val(state_branch_map, sk);
+      for (j = 0; j < MAP_SIZE; j++) {
+        if (rare_branch_bitmap[j] && sbmap[j]) nr++;
+      }
+    }
+
+    nr_arr[i] = (double)nr;
+    ns_arr[i] = (double)state->selected_times;
+    nf_arr[i] = (double)state->fuzzs;
+    np_arr[i] = (double)state->paths_discovered;
+
+    sum_nr += nr_arr[i];
+    sum_ns += ns_arr[i];
+    sum_nf += nf_arr[i];
+    sum_np += np_arr[i];
+  }
+
+  /* TOPSIS */
+  u32 *state_scores = (u32 *)ck_alloc(state_ids_count * sizeof(u32));
+
+  double wr = RBFUZZ_WEIGHT_NR;  /* 0.3 */
+  double ws = RBFUZZ_WEIGHT_NS;  /* 0.3 */
+  double wf = RBFUZZ_WEIGHT_NF;  /* 0.3 */
+  double wp = RBFUZZ_WEIGHT_NP;  /* 0.1 */
+  
+  for(i = 0; i < state_ids_count; i++) {
+
+    /* Normalization */
+    double c_nr = (sum_nr > 0) ? wr * (nr_arr[i] / sum_nr) : 0;
+    double c_ns = (sum_ns > 0) ? ws * (ns_arr[i] / sum_ns) : 0;
+    double c_nf = (sum_nf > 0) ? wf * (nf_arr[i] / sum_nf) : 0;
+    double c_np = (sum_np > 0) ? wp * (np_arr[i] / sum_np) : 0;
+
+    /* Calculation of Euclidean distance */
+    double dist_ideal = sqrt(
+      pow(wr - c_nr, 2) +
+      pow(0  - c_ns, 2) +
+      pow(0  - c_nf, 2) +
+      pow(wp - c_np, 2)
+    );
+
+    double dist_neg = sqrt(
+      pow(0  - c_nr, 2) +
+      pow(ws - c_ns, 2) +
+      pow(wf - c_nf, 2) +
+      pow(0  - c_np, 2)
+    );
+
+    /* Calculation of state score */
+    u32 score = 1;
+    if (dist_ideal + dist_neg > 0) {
+      score = (u32)(1000.0 * dist_neg / (dist_ideal + dist_neg));
+    }
+
+    if (score == 0) score = 1;
+    state_scores[i] = (i == 0) ? score : state_scores[i - 1] + score;
+  }
+
+  /* Selection */
+  u32 randV = UR(state_scores[state_ids_count - 1]);
+  u32 idx = index_search(state_scores, state_ids_count, randV);
+  u32 result = state_ids[idx];
+
+  ck_free(nr_arr);
+  ck_free(ns_arr);
+  ck_free(nf_arr);
+  ck_free(np_arr);
+  ck_free(state_scores);
+
+  return result;
+}
+
+/* change */
 
 /* Select a target state at which we do state-aware fuzzing */
 unsigned int choose_target_state(u8 mode) {
@@ -760,6 +940,65 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
 
   return result;
 }
+
+/* change */
+
+struct queue_entry *rbfuzz_seed_selection(u32 target_state_id) {
+  khint_t k = kh_get(hms, khms_states, target_state_id);
+  if (k == kh_end(khms_states)) return NULL;
+
+  state_info_t *state = kh_val(khms_states, k);
+  if (state->seeds_count == 0) return NULL;
+
+  khint_t sk = kh_get(sbm, state_branch_map, target_state_id);
+  if (sk == kh_end(state_branch_map)) goto fallback;
+  u8 *state_bmap = kh_val(state_branch_map, sk);
+
+  u32 i, j;
+
+  for (i = 0; i < state->seeds_count; i++) {
+    struct queue_entry *seed = (struct queue_entry *)state->seeds[i];
+
+    /* Get this seed's branch bitmap (Algorithm 2, line 3) */
+    khint_t sdk = kh_get(sdbm, seed_branch_map, seed->index);
+    if (sdk == kh_end(seed_branch_map)) continue;
+    u8 *seed_bmap = kh_val(seed_branch_map, sdk);
+
+    /* Get or create this seed's fuzzed-branches record */
+    khint_t fbk = kh_get(fbm, fuzzed_branches_map, seed->index);
+    u8 *fuzzed_bmap;
+    if (fbk == kh_end(fuzzed_branches_map)) {
+      int ret;
+      fuzzed_bmap = (u8 *)ck_alloc(MAP_SIZE);
+      fbk = kh_put(fbm, fuzzed_branches_map, seed->index, &ret);
+      kh_val(fuzzed_branches_map, fbk) = fuzzed_bmap;
+    } else {
+      fuzzed_bmap = kh_val(fuzzed_branches_map, fbk);
+    }
+    u32 min_hits = UINT32_MAX;
+    u32 min_branch = UINT32_MAX;
+
+    for (j = 0; j < MAP_SIZE; j++) {
+      if (rare_branch_bitmap[j] && state_bmap[j] && seed_bmap[j]  /* three-way intersection */
+          && !fuzzed_bmap[j]                                       /* not yet fuzzed */
+          && branch_hits_map[j] < min_hits) {                      /* lowest hit count */
+        min_hits = branch_hits_map[j];
+        min_branch = j;
+      }
+    }
+
+    if (min_branch != UINT32_MAX) {
+      fuzzed_bmap[min_branch] = 1;  /* mark as fuzzed (Algorithm 3, line 8) */
+      return seed;
+    }
+  }
+
+fallback:
+  /* All seeds exhausted: fall back to AFLNet's default seed selection */
+  return choose_seed(target_state_id, seed_selection_algo);
+}
+
+/* change */
 
 /* Update state-aware variables */
 void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
@@ -5487,6 +5726,66 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   fault = run_target(argv, exec_tmout);
 
+  /* change */
+
+  u32 rb_i;
+  for(rb_i = 0; rb_i < MAP_SIZE; rb_i++) {
+    if (trace_bits[rb_i]) branch_hits_map[rb_i]++;
+  }
+
+  if (queue_cur) {
+    khint_t sdk = kh_get(sdbm, seed_branch_map, queue_cur->index);
+    u8 *seed_bmap;
+
+    if (sdk == kh_end(seed_branch_map)) {
+      /* First time seeing this seed: allocate a new bitmap */
+      int ret;
+      seed_bmap = (u8 *)ck_alloc(MAP_SIZE);
+      sdk = kh_put(sdbm, seed_branch_map, queue_cur->index, &ret);
+      kh_val(seed_branch_map, sdk) = seed_bmap;
+    } else {
+      seed_bmap = kh_val(seed_branch_map, sdk);
+    }
+
+    for (rb_i = 0; rb_i < MAP_SIZE; rb_i++) {
+      if (trace_bits[rb_i]) seed_bmap[rb_i] = 1;
+    }
+  }
+
+  if (state_sequence && state_count > 0) {
+    khash_t(hs32) *khs_visited = kh_init(hs32);
+
+    u32 rb_j;
+    for (rb_j = 0; rb_j < state_count; rb_j++) {
+      u32 sid = state_sequence[rb_j];
+
+      if (kh_get(hs32, khs_visited, sid) != kh_end(khs_visited)) continue;
+      int dummy;
+      kh_put(hs32, khs_visited, sid, &dummy);
+
+      khint_t sk = kh_get(sbm, state_branch_map, sid);
+      u8 *state_bmap;
+
+      if (sk == kh_end(state_branch_map)) {
+        int ret;
+        state_bmap = (u8 *)ck_alloc(MAP_SIZE);
+        sk = kh_put(sbm, state_branch_map, sid, &ret);
+        kh_val(state_branch_map, sk) = state_bmap;
+      } else {
+        state_bmap = kh_val(state_branch_map, sk);
+      }
+
+      for (rb_i = 0; rb_i < MAP_SIZE; rb_i++) {
+        if (trace_bits[rb_i]) state_bmap[rb_i] = 1;
+      }
+    }
+
+    kh_destroy(hs32, khs_visited);
+  }
+  
+  /* change */
+
+
   //Update fuzz count, no matter whether the generated test is interesting or not
   if (state_aware_mode) update_fuzzs();
 
@@ -9410,9 +9709,25 @@ int main(int argc, char** argv) {
     while (1) {
       u8 skipped_fuzz;
 
+      /* change */
+      rbfuzz_iteration_count++;
+      if (rbfuzz_iteration_count > RBFUZZ_WARMUP_CYCLES) {
+        rbfuzz_guided_mode = 1;
+      }
+      /* change */
+
       struct queue_entry *selected_seed = NULL;
       while(!selected_seed || selected_seed->region_count == 0) {
-        target_state_id = choose_target_state(state_selection_algo);
+
+        /* change */
+        if (rbfuzz_guided_mode == 1) {
+          identify_rare_branches();
+          target_state_id = rbfuzz_topsis_select_state();
+        }else {
+          target_state_id = choose_target_state(state_selection_algo);
+        }
+        /* change */
+        
 
         /* Update favorites based on the selected state */
         cull_queue();
@@ -9423,7 +9738,14 @@ int main(int argc, char** argv) {
           kh_val(khms_states, k)->selected_times++;
         }
 
-        selected_seed = choose_seed(target_state_id, seed_selection_algo);
+        /* change */
+        if (rbfuzz_guided_mode == 1) {
+          selected_seed = rbfuzz_seed_selection(target_state_id);
+        } else {
+          selected_seed = choose_seed(target_state_id, seed_selection_algo);
+        }
+        /* change */
+        
       }
 
       /* Seek to the selected seed */

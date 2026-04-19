@@ -336,6 +336,16 @@
 
 #define STATE_STR_LEN 12
 
+/* change */
+/* RBFUZZ configuration */
+#define RBFUZZ_WARMUP_CYCLES    10   /* Number of iterations before switching to rare branch guided mode */
+#define RBFUZZ_WEIGHT_NR        0.3    /* TOPSIS weight for rare branch score */
+#define RBFUZZ_WEIGHT_NS        0.3    /* TOPSIS weight for selected times */
+#define RBFUZZ_WEIGHT_NF        0.3    /* TOPSIS weight for fuzz count */
+#define RBFUZZ_WEIGHT_NP        0.1    /* TOPSIS weight for paths discovered */
+/* change */
+
+
 /* Maximum allocator request size (keep well under INT_MAX): */
 
 #define MAX_ALLOC           0x40000000

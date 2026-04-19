@@ -30,6 +30,11 @@ typedef struct {
   u32 selected_seed_index;    /* the recently selected seed index */
   void **seeds;               /* keeps all seeds reaching this state -- can be casted to struct queue_entry* */
   u32 seeds_count;            /* total number of seeds, it must be equal the size of the seeds array */
+
+  /* change */
+  u32 rare_branch_score;      /* rare branch */
+  /* change */
+
 } state_info_t;
 
 enum {
@@ -69,6 +74,14 @@ KHASH_INIT(hms, khint32_t, state_info_t *, 1, kh_int_hash_func, kh_int_hash_equa
 
 // Initialize a map with int key and u32 value
 KHASH_MAP_INIT_INT(32, u32)
+
+/* change */
+/* RBFUZZ: hash tables mapping state/seed to branch bitmaps */
+KHASH_MAP_INIT_INT(sbm, u8*)    /* state_id -> branch bitmap (MAP_SIZE bytes) */
+KHASH_MAP_INIT_INT(sdbm, u8*)   /* seed_index -> branch bitmap (MAP_SIZE bytes) */
+KHASH_MAP_INIT_INT(fbm, u8*)    /* seed_index -> fuzzed rare branches bitmap */
+/* change */
+
 
 // Functions for extracting requests and responses
 
