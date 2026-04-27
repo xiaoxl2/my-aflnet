@@ -338,7 +338,7 @@
 
 /* change */
 /* RBFUZZ configuration */
-#define RBFUZZ_WARMUP_EXECS     500 /* Number of executions before switching to rare branch guided mode */
+#define RBFUZZ_WARMUP_EXECS     50000 /* Number of executions before switching to rare branch guided mode */
 #define RBFUZZ_WEIGHT_NR        0.3    /* TOPSIS weight for rare branch score */
 #define RBFUZZ_WEIGHT_NS        0.3    /* TOPSIS weight for selected times */
 #define RBFUZZ_WEIGHT_NF        0.3    /* TOPSIS weight for fuzz count */
