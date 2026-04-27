@@ -664,8 +664,10 @@ void identify_rare_branches() {
   /* set threshold */
   if(min_hits == UINT32_MAX) {
     rare_branch_threshold = 1;
+  } else if (min_hits >= (1U << 31)) {
+    rare_branch_threshold = UINT32_MAX;
   } else {
-    rare_branch_threshold = 1 << (32 - __builtin_clz(min_hits));
+    rare_branch_threshold = 1U << (32 - __builtin_clz(min_hits));
   }
 
   /* mark branches */
@@ -942,6 +944,68 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
 }
 
 /* change */
+
+void rbfuzz_record_branch_hits(void) {
+  u32 i;
+
+  for(i = 0; i < MAP_SIZE; i++) {
+    if (trace_bits[i]) branch_hits_map[i]++;
+  }
+}
+
+void rbfuzz_record_state_branches(void) {
+  if (state_sequence && state_count > 0) {
+    khash_t(hs32) *khs_visited = kh_init(hs32);
+
+    u32 i, j;
+    for (j = 0; j < state_count; j++) {
+      u32 sid = state_sequence[j];
+
+      if (kh_get(hs32, khs_visited, sid) != kh_end(khs_visited)) continue;
+      int dummy;
+      kh_put(hs32, khs_visited, sid, &dummy);
+
+      khint_t sk = kh_get(sbm, state_branch_map, sid);
+      u8 *state_bmap;
+
+      if (sk == kh_end(state_branch_map)) {
+        int ret;
+        state_bmap = (u8 *)ck_alloc(MAP_SIZE);
+        sk = kh_put(sbm, state_branch_map, sid, &ret);
+        kh_val(state_branch_map, sk) = state_bmap;
+      } else {
+        state_bmap = kh_val(state_branch_map, sk);
+      }
+
+      for (i = 0; i < MAP_SIZE; i++) {
+        if (trace_bits[i]) state_bmap[i] = 1;
+      }
+    }
+
+    kh_destroy(hs32, khs_visited);
+  }
+}
+
+void rbfuzz_record_seed_branches(struct queue_entry *seed) {
+  if (!seed) return;
+
+  khint_t sdk = kh_get(sdbm, seed_branch_map, seed->index);
+  u8 *seed_bmap;
+
+  if (sdk == kh_end(seed_branch_map)) {
+    int ret;
+    seed_bmap = (u8 *)ck_alloc(MAP_SIZE);
+    sdk = kh_put(sdbm, seed_branch_map, seed->index, &ret);
+    kh_val(seed_branch_map, sdk) = seed_bmap;
+  } else {
+    seed_bmap = kh_val(seed_branch_map, sdk);
+  }
+
+  u32 i;
+  for (i = 0; i < MAP_SIZE; i++) {
+    if (trace_bits[i]) seed_bmap[i] = 1;
+  }
+}
 
 struct queue_entry *rbfuzz_seed_selection(u32 target_state_id) {
   khint_t k = kh_get(hms, khms_states, target_state_id);
@@ -3821,6 +3885,10 @@ static void perform_dry_run(char** argv) {
     res = calibrate_case(argv, q, use_mem, 0, 1);
     ck_free(use_mem);
 
+    rbfuzz_record_branch_hits();
+    rbfuzz_record_state_branches();
+    rbfuzz_record_seed_branches(q);
+
     /* Update state-aware variables (e.g., state machine, regions and their annotations */
     if (state_aware_mode) update_state_aware_variables(q, 1);
 
@@ -4255,6 +4323,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
     /* We use the actual length of all messages (full_len), not the len of the mutated message subsequence (len)*/
     add_to_queue(fn, full_len, 0);
+
+    rbfuzz_record_seed_branches(queue_top);
 
     if (state_aware_mode) update_state_aware_variables(queue_top, 0);
 
@@ -5516,6 +5586,12 @@ static void show_stats(void) {
     }
   }
 
+  if (state_aware_mode) {
+    SAYF(cRST "\nRBFUZZ mode: %s | total_execs: %s | warmup_execs: %s\n",
+         rbfuzz_guided_mode ? "guided" : "default",
+         DI(total_execs), DI(RBFUZZ_WARMUP_EXECS));
+  }
+
   /* Hallelujah! */
 
   fflush(0);
@@ -5728,60 +5804,8 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   /* change */
 
-  u32 rb_i;
-  for(rb_i = 0; rb_i < MAP_SIZE; rb_i++) {
-    if (trace_bits[rb_i]) branch_hits_map[rb_i]++;
-  }
-
-  if (queue_cur) {
-    khint_t sdk = kh_get(sdbm, seed_branch_map, queue_cur->index);
-    u8 *seed_bmap;
-
-    if (sdk == kh_end(seed_branch_map)) {
-      /* First time seeing this seed: allocate a new bitmap */
-      int ret;
-      seed_bmap = (u8 *)ck_alloc(MAP_SIZE);
-      sdk = kh_put(sdbm, seed_branch_map, queue_cur->index, &ret);
-      kh_val(seed_branch_map, sdk) = seed_bmap;
-    } else {
-      seed_bmap = kh_val(seed_branch_map, sdk);
-    }
-
-    for (rb_i = 0; rb_i < MAP_SIZE; rb_i++) {
-      if (trace_bits[rb_i]) seed_bmap[rb_i] = 1;
-    }
-  }
-
-  if (state_sequence && state_count > 0) {
-    khash_t(hs32) *khs_visited = kh_init(hs32);
-
-    u32 rb_j;
-    for (rb_j = 0; rb_j < state_count; rb_j++) {
-      u32 sid = state_sequence[rb_j];
-
-      if (kh_get(hs32, khs_visited, sid) != kh_end(khs_visited)) continue;
-      int dummy;
-      kh_put(hs32, khs_visited, sid, &dummy);
-
-      khint_t sk = kh_get(sbm, state_branch_map, sid);
-      u8 *state_bmap;
-
-      if (sk == kh_end(state_branch_map)) {
-        int ret;
-        state_bmap = (u8 *)ck_alloc(MAP_SIZE);
-        sk = kh_put(sbm, state_branch_map, sid, &ret);
-        kh_val(state_branch_map, sk) = state_bmap;
-      } else {
-        state_bmap = kh_val(state_branch_map, sk);
-      }
-
-      for (rb_i = 0; rb_i < MAP_SIZE; rb_i++) {
-        if (trace_bits[rb_i]) state_bmap[rb_i] = 1;
-      }
-    }
-
-    kh_destroy(hs32, khs_visited);
-  }
+  rbfuzz_record_branch_hits();
+  rbfuzz_record_state_branches();
   
   /* change */
 
@@ -9711,8 +9735,9 @@ int main(int argc, char** argv) {
 
       /* change */
       rbfuzz_iteration_count++;
-      if (rbfuzz_iteration_count > RBFUZZ_WARMUP_CYCLES) {
+      if (!rbfuzz_guided_mode && total_execs > RBFUZZ_WARMUP_EXECS) {
         rbfuzz_guided_mode = 1;
+        ACTF("RBFUZZ guided mode enabled after %llu executions.", total_execs);
       }
       /* change */
 
